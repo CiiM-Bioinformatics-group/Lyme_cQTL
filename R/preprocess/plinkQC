@@ -1,0 +1,157 @@
+sample = config["sample"] #Sample name from the plink files, needs to be kept at a folder called Samples/
+
+import yaml
+import os
+import glob
+from itertools import product
+import json
+import sys
+import re
+
+ext = ["bed","bim","fam"]
+G1000 = "../1000G/1000genome"
+rscript  = "code/preprocess/plinkQC_qc.R" #Path to the plinkQC Rscript, could be copied to the directory or at /vol/projects/CIIM/Analysis_pipelines/GWAS/SNP_QC/
+##Output files would be written into the working directory: required folders QC/ 1000G/
+
+## The last rule should include all output files from each rule and contain no output. Full paths with no wildcards are needed.
+rule all:
+    input:
+        ## Expand outputs as string list replacing the wildcard for each of the components in the list given.
+        expand("data/{sample}_1000g.{ext}", sample = sample,ext=ext),
+        expand("QC/{sample}_1000g.mds",  sample = sample),
+        expand("QC/{sample}_1000g.eigenvec",  sample = sample),
+        expand("1000G/1000genome.no_ac_gt_snps.{sample}.clean.{ext}",ext=ext, sample = sample),
+        expand("Plots/{sample}.PCA.ancestry.pdf",sample=sample),
+        expand("QC/{sample}.clean-updated-chr{chr}_sorted.vcf.gz",sample=sample, chr = range(1,23))
+        #expand(,sample=sample)
+
+os.system('mkdir 1000G')
+os.system('mkdir QC')
+os.system('mkdir Plots')
+
+          ## This last command checks in each pair of related samples which one has a higher missingness rate
+## 1000G files can be downloaded from https://www.cog-genomics.org/plink/2.0/resources#1kg_phase3 (the links in bold).
+## The rule that takes the longest to run
+rule acgt_1000G:
+    input:
+        expand(G1000+".{ext}", ext=ext)
+    output:
+        expand("1000G/1000genome.no_ac_gt_snps.{ext}", ext=ext)
+    shell:
+        "awk \'BEGIN {{OFS=\"\t\"}} ($5$6 == \"GC\" \
+        || $5$6 == \"CG\" || $5$6 == \"AT\" || $5$6 == \"TA\")\
+        {{print $2}}\' "+G1000+".bim > 1000G/1000genome.ac_gt_snps ;\
+        /vol/projects/CIIM/resources/tools/plink --bfile "+G1000+" --exclude 1000G/1000genome.ac_gt_snps --make-bed --out 1000G/1000genome.no_ac_gt_snps --allow-extra-chr"
+
+rule acgt_prune_samples:
+    input:
+        expand("data/{{sample}}.{ext}", ext=ext)
+    output:
+        expand("QC/{{sample}}.no_ac_gt_snps.{ext}", ext=ext),
+        "QC/{sample}.no_ac_gt_snps.prune.in"
+    shell:
+        "awk \'BEGIN {{OFS=\"\t\"}} ($5$6 == \"GC\" \
+        || $5$6 == \"CG\" || $5$6 == \"AT\" || $5$6 == \"TA\")\
+        {{print $2}}\' data/{wildcards.sample}.bim > QC/{wildcards.sample}.ac_gt_snps ;\
+        /vol/projects/CIIM/resources/tools/plink --bfile data/{wildcards.sample} --exclude QC/{wildcards.sample}.ac_gt_snps --make-bed --out QC/{wildcards.sample}.no_ac_gt_snps --allow-extra-chr ;\
+        /vol/projects/CIIM/resources/tools/plink --bfile QC/{wildcards.sample}.no_ac_gt_snps --indep-pairwise 50 5 0.2 --out QC/{wildcards.sample}.no_ac_gt_snps"
+
+# Code from https://cran.r-project.org/web/packages/plinkQC/vignettes/AncestryCheck.pdf
+rule clean_1000G:
+    input:
+        G = expand("1000G/1000genome.no_ac_gt_snps.{ext}", ext=ext),
+        B = expand("QC/{{sample}}.no_ac_gt_snps.{ext}", ext=ext),
+        P = "QC/{sample}.no_ac_gt_snps.prune.in"
+    output:
+        expand("QC/{{sample}}.no_ac_gt_snps.pruned.{ext}", ext=ext),
+        expand("1000G/1000genome.no_ac_gt_snps.{{sample}}.clean.{ext}",ext=ext)
+    shell:
+        "/vol/projects/CIIM/resources/tools/plink --bfile QC/{wildcards.sample}.no_ac_gt_snps --chr 1-23 --extract QC/{wildcards.sample}.no_ac_gt_snps.prune.in --make-bed --out QC/{wildcards.sample}.no_ac_gt_snps.pruned ;\
+        /vol/projects/CIIM/resources/tools/plink --bfile 1000G/1000genome.no_ac_gt_snps --chr 1-23 --extract QC/{wildcards.sample}.no_ac_gt_snps.prune.in --make-bed --out 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.pruned --allow-extra-chr;\
+        awk \'BEGIN {{OFS=\"\t\"}} FNR==NR {{a[$2]=$1; next}} \
+        ($2 in a && a[$2] != $1) {{print a[$2],$2}}\' \
+        QC/{wildcards.sample}.no_ac_gt_snps.pruned.bim 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.pruned.bim | \
+        sed -n \'/^[XY]/!p\' > 1000G/1000genome.{wildcards.sample}.toUpdateChr ;\
+        /vol/projects/CIIM/resources/tools/plink --bfile 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.pruned --update-chr 1000G/1000genome.{wildcards.sample}.toUpdateChr 1 2  --make-bed --out 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.updateChr ;\
+        awk \'BEGIN {{OFS=\"\t\"}} FNR==NR {{a[$2]=$4; next}} \
+        ($2 in a && a[$2] != $4) {{print a[$2],$2}}\' \
+        QC/{wildcards.sample}.no_ac_gt_snps.pruned.bim 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.pruned.bim  > 1000G/1000genome.{wildcards.sample}.toUpdatePos ;\
+        awk \'BEGIN {{OFS=\"\t\"}} FNR==NR {{a[$1$2$4]=$5$6; next}} \
+        ($1$2$4 in a && a[$1$2$4] != $5$6 && a[$1$2$4] != $6$5) {{print $2}}\' \
+        QC/{wildcards.sample}.no_ac_gt_snps.pruned.bim 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.pruned.bim  > 1000G/1000genome.{wildcards.sample}.toFlip;\
+        /vol/projects/CIIM/resources/tools/plink --bfile 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.updateChr --update-map 1000G/1000genome.{wildcards.sample}.toUpdatePos 1 2 \
+        --flip 1000G/1000genome.{wildcards.sample}.toFlip --make-bed --out 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.flipped ;\
+        awk \'BEGIN {{OFS=\"\t\"}} FNR==NR {{a[$1$2$4]=$5$6; next}} \
+        ($1$2$4 in a && a[$1$2$4] != $5$6 && a[$1$2$4] != $6$5) {{print $2}}\' \
+        QC/{wildcards.sample}.no_ac_gt_snps.pruned.bim 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.flipped.bim  > 1000G/1000genome.{wildcards.sample}.mismatch;\
+        /vol/projects/CIIM/resources/tools/plink --bfile 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.flipped --exclude 1000G/1000genome.{wildcards.sample}.mismatch \
+        --make-bed --out 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.clean"
+
+rule merge_1000G:
+    input:
+        expand("QC/{{sample}}.no_ac_gt_snps.pruned.{ext}", ext=ext),
+        expand("1000G/1000genome.no_ac_gt_snps.{{sample}}.clean.{ext}",ext=ext)
+    output:
+        expand("data/{{sample}}_1000g.{ext}",ext=ext)
+    shell:
+        "/vol/projects/CIIM/resources/tools/plink --bfile QC/{wildcards.sample}.no_ac_gt_snps.pruned \
+        --bmerge 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.clean.bed 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.clean.bim 1000G/1000genome.no_ac_gt_snps.{wildcards.sample}.clean.fam \
+        --make-bed --out data/{wildcards.sample}_1000g --allow-no-sex "
+
+
+rule ancestry:
+    input:
+        expand("data/{{sample}}_1000g.{ext}",ext=ext)
+    output:
+        "QC/{sample}_1000g.mds","QC/{sample}_1000g.eigenvec"
+    shell:
+        "/vol/projects/CIIM/resources/tools/plink --bfile data/{wildcards.sample}_1000g --pca --mds-plot 4 --cluster --out QC/{wildcards.sample}_1000g "
+
+rule plinkQC:
+    input:
+        mds = "QC/{sample}_1000g.mds",
+        eigen = "QC/{sample}_1000g.eigenvec",
+        rscript = rscript
+    output:
+        "Plots/{sample}.PCA.ancestry.pdf",
+        expand("QC/{{sample}}.clean.{ext}", ext = ext)
+    shell:
+        "/vol/biotools/alma8/R-4.2.0/bin/Rscript {input.rscript} {wildcards.sample} TRUE"
+
+
+rule freq:
+    input:
+        expand("QC/{{sample}}.clean.{ext}", ext = ext)
+    output:
+        "QC/{sample}.clean.frq"
+    shell:
+        "/vol/projects/CIIM/resources/tools/plink --bfile QC/{wildcards.sample}.clean --freq --out QC/{wildcards.sample}.clean"
+
+rule update_strand:
+    input:
+        pl = "../GWAS/HRC/HRC-1000G-check-bim.pl",
+        r = "../GWAS/HRC/HRC.r1-1.GRCh37.wgs.mac5.sites.tab.gz",
+        b = "QC/{sample}.clean.bim",
+        f = "QC/{sample}.clean.frq"
+    output:
+        expand("QC/{{sample}}.clean-updated-chr{chr}.vcf", chr=range(1,23))
+    shell:
+        "perl {input.pl} -b {input.b} -f {input.f} -r {input.r} -h sh Run-plink.sh ;\
+        cd QC ; sh Run-plink.sh "
+
+rule sort:
+    input:
+        "QC/{sample}.clean-updated-chr{chr}.vcf"
+    output:
+        "QC/{sample}.clean-updated-chr{chr}_sorted.vcf.gz"
+    shell:
+        "bcftools sort {input}  | bgzip -c > {output}"
+
+## After this, samples can be uploaded to the michigan imputation server
+#
+# Reference Panel:	HRC 1.1 2016 (GRCh37/hg19)
+# rsq Filter:		off
+# Array Build:		GRCh37/hg19 (depends on your input file)
+# 	Phasing:		Eagle v2.4 (phased output)
+# Population:		EUR
+# 	Mode:			Quality Control & Imputation
